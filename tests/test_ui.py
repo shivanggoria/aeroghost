@@ -50,3 +50,33 @@ def test_main_window_stealth_mode_toggle(qapp, tmp_path):
 
     win.close()
     mgr.shutdown()
+
+
+def test_dual_in_process_windows_launch(qapp):
+    """Verify that _launch_dual_in_process_windows opens both windows side-by-side without error."""
+    from main import _launch_dual_in_process_windows
+    import time
+    
+    success = _launch_dual_in_process_windows(qapp, "dual-test-room", "testpass123")
+    assert success is True
+    
+    # Verify windows exist on app
+    win_alice, win_bob, alice_mgr, bob_mgr = qapp._dual_instances
+    assert win_alice.isVisible() is True
+    assert win_bob.isVisible() is True
+    assert win_alice.width() > 0
+    assert win_bob.width() > 0
+
+    # Wait for handshake
+    time.sleep(0.4)
+    qapp.processEvents()
+
+    # Verify both peers see each other
+    assert len(alice_mgr.engine.peers) == 1
+    assert len(bob_mgr.engine.peers) == 1
+
+    # Clean up
+    win_alice.close()
+    win_bob.close()
+    alice_mgr.shutdown()
+    bob_mgr.shutdown()

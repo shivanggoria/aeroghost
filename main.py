@@ -27,42 +27,86 @@ def parse_args():
     parser.add_argument("--mode", choices=["bluetooth", "test"], default=None, help="Transport mode")
     parser.add_argument("--target", type=str, default=None, help="Target peer MAC or IP to join")
     parser.add_argument("--port", type=int, default=None, help="Port or RFCOMM channel number")
-    return parser.parse_args()
+    
+    # Strip any leading script or executable name if passed as first argument
+    raw_args = sys.argv[1:]
+    if raw_args and (raw_args[0].endswith(".py") or raw_args[0].endswith(".exe")):
+        raw_args = raw_args[1:]
+    return parser.parse_args(raw_args)
 
 
-def _launch_dual_local_instances(room_name: str, password: str):
-    """Launches Host and Client instances side-by-side on this machine for instant verification."""
-    python_exe = sys.executable
+def _launch_dual_in_process_windows(app: QApplication, room_name: str, password: str) -> bool:
+    """
+    Launches Host and Client windows side-by-side directly within this Qt process.
+    Completely immune to PyInstaller _MEIPASS deletion and Qt platform plugin initialization errors.
+    """
     port = 19840
-    cwd = os.path.dirname(os.path.abspath(__file__))
+    
+    # 1. Initialize Alice (Host Coordinator)
+    alice_mgr = GroupManager(
+        nickname="Alice (Host)",
+        is_bluetooth_mode=False,
+        db_path=f"aeroghost_{room_name}_Alice.vault"
+    )
+    alice_ok = alice_mgr.setup_room(
+        room_name=room_name,
+        password=password,
+        is_host=True,
+        port=port
+    )
+    if not alice_ok:
+        QMessageBox.warning(
+            None, "Port In Use",
+            f"Port {port} is already in use by another running instance.\n"
+            "Please close any existing AeroGhost windows and try again."
+        )
+        return False
 
-    # 1. Launch Host instance
-    host_cmd = [
-        python_exe, "main.py",
-        "--room", room_name,
-        "--password", password,
-        "--nick", "Alice (Host)",
-        "--role", "host",
-        "--mode", "test",
-        "--port", str(port)
-    ]
-    subprocess.Popen(host_cmd, cwd=cwd)
+    # 2. Initialize Bob (Client Member)
+    bob_mgr = GroupManager(
+        nickname="Bob (Client)",
+        is_bluetooth_mode=False,
+        db_path=f"aeroghost_{room_name}_Bob.vault"
+    )
+    bob_mgr.setup_room(
+        room_name=room_name,
+        password=password,
+        is_host=False,
+        port=port
+    )
+    time.sleep(0.3)
+    bob_connected = bob_mgr.join_host("127.0.0.1", port=port)
+    if not bob_connected:
+        alice_mgr.shutdown()
+        bob_mgr.shutdown()
+        QMessageBox.warning(
+            None, "Connection Failed",
+            f"Unable to establish local loopback connection on port {port}."
+        )
+        return False
 
-    # Allow 0.8s for host listener socket to initialize
-    time.sleep(0.8)
+    # 3. Create both windows
+    win_alice = MainWindow(alice_mgr)
+    win_bob = MainWindow(bob_mgr)
 
-    # 2. Launch Client instance
-    client_cmd = [
-        python_exe, "main.py",
-        "--room", room_name,
-        "--password", password,
-        "--nick", "Bob (Client)",
-        "--role", "client",
-        "--mode", "test",
-        "--target", "127.0.0.1",
-        "--port", str(port)
-    ]
-    subprocess.Popen(client_cmd, cwd=cwd)
+    # Position side-by-side on screen
+    primary_screen = app.primaryScreen()
+    if primary_screen:
+        geom = primary_screen.availableGeometry()
+        w = min(680, (geom.width() // 2) - 16)
+        h = min(720, geom.height() - 80)
+        win_alice.setGeometry(geom.x() + 10, geom.y() + 40, w, h)
+        win_bob.setGeometry(geom.x() + w + 20, geom.y() + 40, w, h)
+    else:
+        win_alice.resize(640, 600)
+        win_bob.resize(640, 600)
+
+    win_alice.show()
+    win_bob.show()
+
+    # Retain references on app to prevent Python GC from destroying windows
+    app._dual_instances = (win_alice, win_bob, alice_mgr, bob_mgr)
+    return True
 
 
 def main():
@@ -124,8 +168,10 @@ def main():
 
         # Handle 1-click dual test launch
         if getattr(setup_dlg, "launch_dual_test", False):
-            _launch_dual_local_instances(setup_dlg.room_name, setup_dlg.password)
-            sys.exit(0)
+            if _launch_dual_in_process_windows(app, setup_dlg.room_name, setup_dlg.password):
+                sys.exit(app.exec())
+            else:
+                continue
 
         room_name = setup_dlg.room_name
         password = setup_dlg.password
