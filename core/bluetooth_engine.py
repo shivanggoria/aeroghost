@@ -27,6 +27,10 @@ class PeerConnection:
         self.peer_id: Optional[str] = None
         self.nickname: str = "Unknown Peer"
         self.is_authenticated: bool = False
+        # Per-session forward-secret key (X25519+HKDF), set once the handshake
+        # completes. While None, traffic on this connection uses the room key
+        # (that covers only the AUTH_HELLO/CHALLENGE/VERIFIED handshake itself).
+        self.session_key: Optional[bytes] = None
         self.is_alive = True
         self._buffer = bytearray()
         self._lock = threading.Lock()
@@ -135,9 +139,10 @@ class BluetoothEngine:
                 if isinstance(data, dict):
                     data = [data]
                 NON_PEER_KEYWORDS = [
-                    "airpod", "headphone", "headset", "earbud", "earphone", 
-                    "speaker", "keyboard", "mouse", "controller", "watch", 
-                    "avrcp", "audio", "stone 350", "h.ear"
+                    "airpod", "headphone", "headset", "earbud", "earphone",
+                    "speaker", "keyboard", "mouse", "controller", "watch",
+                    "avrcp", "audio", "stone 350", "h.ear",
+                    "sound", "soundbar", "buds", "tws", "band", "fitness", "tv"
                 ]
                 for item in data:
                     name = item.get("FriendlyName", "").strip()

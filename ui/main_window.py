@@ -4,16 +4,17 @@ Integrates GroupManager, Chat Stream, File Transfers, System Tray, and Stealth M
 """
 
 import os
+import html
 import time
 from typing import Dict, List, Any, Optional
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
-    QLineEdit, QPushButton, QTextBrowser, QListWidget, QListWidgetItem, 
-    QFrame, QProgressBar, QFileDialog, QSlider, QSystemTrayIcon, 
-    QMenu, QMessageBox, QApplication
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+    QLineEdit, QPushButton, QTextBrowser, QListWidget, QListWidgetItem,
+    QFrame, QProgressBar, QFileDialog, QSlider, QSystemTrayIcon,
+    QMenu, QMessageBox, QApplication, QStyle
 )
-from PySide6.QtCore import Qt, Signal, QObject, QTime
-from PySide6.QtGui import QIcon, QKeySequence, QShortcut, QColor
+from PySide6.QtCore import Qt, Signal, QObject, QEvent
+from PySide6.QtGui import QIcon, QKeySequence, QShortcut, QColor, QPixmap, QPainter, QFont
 
 from core.group_manager import GroupManager
 from ui.stealth_mode import StealthManager
@@ -42,6 +43,7 @@ class MainWindow(QMainWindow):
 
         self.messages: List[Dict[str, Any]] = []
         self.setWindowTitle("AeroGhost - Bluetooth P2P Secure Chat")
+        self.setWindowIcon(self._build_app_icon())
         self.resize(860, 580)
         self.setStyleSheet(NORMAL_STYLE)
 
@@ -50,12 +52,36 @@ class MainWindow(QMainWindow):
         self._setup_tray()
         self._connect_signals()
 
+        # Populate the roster immediately so members already connected (e.g. the
+        # instant 2-window test, where the handshake finishes before this window
+        # is built) are shown without waiting for the next roster event.
+        self._update_peers_ui(self.mgr.get_roster())
+
         # Load local encrypted chat history for this room
         if self.mgr.crypto:
             cached = self.mgr.storage.load_messages(self.mgr.crypto)
             for m in cached:
                 self.messages.append(m)
             self.refresh_chat_display()
+
+    @staticmethod
+    def _build_app_icon() -> QIcon:
+        """Draws a small app icon in code so the window and tray entry are identifiable."""
+        pix = QPixmap(64, 64)
+        pix.fill(Qt.transparent)
+        painter = QPainter(pix)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setBrush(QColor("#0EA5E9"))
+        painter.setPen(Qt.NoPen)
+        painter.drawRoundedRect(6, 6, 52, 52, 14, 14)
+        painter.setPen(QColor("#F8FAFC"))
+        font = QFont()
+        font.setBold(True)
+        font.setPixelSize(34)
+        painter.setFont(font)
+        painter.drawText(pix.rect(), Qt.AlignCenter, "A")
+        painter.end()
+        return QIcon(pix)
 
     def _init_ui(self):
         central_widget = QWidget()
@@ -137,6 +163,7 @@ class MainWindow(QMainWindow):
         stealth_label = QLabel("Doc Note")
         stealth_label.setStyleSheet("color: #718096; font-size: 11px;")
         stealth_layout.addWidget(stealth_label)
+        stealth_layout.addStretch(1)  # push opacity + close control to the right
 
         # Opacity slider
         self.opacity_slider = QSlider(Qt.Horizontal)
@@ -161,6 +188,7 @@ class MainWindow(QMainWindow):
         t_layout = QVBoxLayout(self.transfer_banner)
         t_layout.setContentsMargins(12, 4, 12, 4)
         self.transfer_lbl = QLabel("Transferring: ...")
+        self.transfer_lbl.setTextFormat(Qt.PlainText)  # never interpret a peer's filename as markup
         self.transfer_lbl.setStyleSheet("font-size: 11px; color: #E2E8F0;")
         self.transfer_bar = QProgressBar()
         self.transfer_bar.setRange(0, 100)
@@ -206,21 +234,32 @@ class MainWindow(QMainWindow):
         self.shortcut_boss = QShortcut(QKeySequence("Ctrl+Shift+H"), self)
         self.shortcut_boss.activated.connect(self.hide_to_tray)
 
-        # Esc: In stealth mode, exit stealth mode
-        self.shortcut_esc = QShortcut(QKeySequence("Esc"), self)
-        self.shortcut_esc.activated.connect(self._on_escape_pressed)
+        # Esc: exit stealth mode. Handled via an application-level event filter
+        # rather than a QShortcut -- a per-window Escape shortcut is consumed
+        # ambiguously when two windows are open, which swallows the key without
+        # firing. The filter below sees the KeyPress directly and is reliable.
+        QApplication.instance().installEventFilter(self)
 
-    def _on_escape_pressed(self):
-        if self.stealth_mgr.is_stealth:
+    def eventFilter(self, obj, event):
+        """Exit stealth on Escape no matter which child widget currently has focus.
+
+        Scoped by is_stealth only (not isActiveWindow, which a stays-on-top stealth
+        window can report False even while focused). Escape acts as a panic exit.
+        """
+        if (event.type() == QEvent.KeyPress and event.key() == Qt.Key_Escape
+                and self.stealth_mgr.is_stealth):
             self.stealth_mgr.exit_stealth()
+            return True
+        return super().eventFilter(obj, event)
 
     def _setup_tray(self):
         self.tray_icon = QSystemTrayIcon(self)
-        # Standard default application icon
         icon = self.windowIcon()
-        if not icon.isNull():
-            self.tray_icon.setIcon(icon)
-        
+        if icon.isNull():
+            icon = self.style().standardIcon(QStyle.SP_ComputerIcon)
+        self.tray_icon.setIcon(icon)
+        self.tray_icon.setToolTip("AeroGhost - click to show/hide")
+
         tray_menu = QMenu()
         action_show = tray_menu.addAction("Open AeroGhost")
         action_show.triggered.connect(self.restore_from_tray)
@@ -298,39 +337,42 @@ class MainWindow(QMainWindow):
             self._append_message_ui(msg)
 
     def _append_message_ui(self, msg: Dict[str, Any]):
-        sender = msg.get("sender", "Peer")
-        content = msg.get("content", "")
+        # Peer-supplied fields are escaped so a message can never inject markup or
+        # a remote resource reference into the rich-text view.
+        sender = html.escape(str(msg.get("sender", "Peer")))
+        content = html.escape(str(msg.get("content", "")))
         ts = msg.get("timestamp", time.time())
-        time_str = QTime.fromMSecsSinceStartOfDay(int(ts * 1000) % 86400000).toString("hh:mm")
+        try:
+            time_str = time.strftime("%H:%M", time.localtime(float(ts)))
+        except (ValueError, TypeError, OSError):
+            time_str = time.strftime("%H:%M", time.localtime())
         is_self = (msg.get("sender_id") == self.mgr.peer_id)
 
         if self.stealth_mgr.is_stealth:
-            # Discreet plain-text format
-            html = f"<div style='margin-bottom: 4px; font-family: monospace; font-size: 11px; color: #2D3748;'>" \
-                   f"<span style='color: #718096;'>[{time_str}]</span> " \
-                   f"<b>{sender}:</b> {content}" \
-                   f"</div>"
+            # Discreet plain-text document style
+            markup = (
+                f"<div style='margin-bottom: 4px; font-family: monospace; font-size: 11px; color: #2D3748;'>"
+                f"<span style='color: #718096;'>[{time_str}]</span> "
+                f"<b>{sender}:</b> {content}"
+                f"</div>"
+            )
         else:
-            # Modern sleek message bubble
+            # Rendered as a single-cell table: Qt's rich-text engine ignores
+            # inline-block/border-radius/max-width, but it does honour table
+            # alignment, width and cell background, giving an aligned, padded bubble.
             bubble_bg = "#0369A1" if is_self else "#1E2028"
             align = "right" if is_self else "left"
             sender_color = "#BAE6FD" if is_self else "#38BDF8"
-            
-            html = f"""
-            <div style='margin-bottom: 8px; text-align: {align};'>
-                <div style='display: inline-block; background-color: {bubble_bg}; 
-                            border-radius: 8px; padding: 8px 12px; max-width: 80%; text-align: left;'>
-                    <div style='font-size: 11px; font-weight: 600; color: {sender_color}; margin-bottom: 2px;'>
-                        {sender} <span style='font-size: 9px; color: #94A3B8; font-weight: normal;'>{time_str}</span>
-                    </div>
-                    <div style='font-size: 13px; color: #F8FAFC; word-wrap: break-word;'>
-                        {content}
-                    </div>
-                </div>
-            </div>
-            """
+            markup = (
+                f"<table width='72%' align='{align}' cellpadding='7' cellspacing='0' style='margin: 3px 0;'>"
+                f"<tr><td style='background-color: {bubble_bg};'>"
+                f"<span style='font-size: 11px; font-weight: 600; color: {sender_color};'>{sender}</span>"
+                f" <span style='font-size: 9px; color: #94A3B8;'>{time_str}</span><br>"
+                f"<span style='font-size: 13px; color: #F8FAFC;'>{content}</span>"
+                f"</td></tr></table>"
+            )
 
-        self.chat_area.append(html)
+        self.chat_area.append(markup)
         # Scroll to bottom
         sb = self.chat_area.verticalScrollBar()
         sb.setValue(sb.maximum())
@@ -381,5 +423,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Ensures clean shutdown of background Bluetooth listeners and sockets."""
+        app = QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self)
         self.mgr.shutdown()
         event.accept()

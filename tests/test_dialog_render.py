@@ -1,46 +1,50 @@
 """
-Test script to render and screenshot RoomSetupDialog in Host, Join (BT), and Join (Mesh) modes.
+Renders RoomSetupDialog in Host, Join (Bluetooth), and Join (Local Mesh) modes
+and saves screenshots.
+
+Written as a real pytest test (not a module-level script) so pytest collects it
+cleanly and it never executes at import time. Screenshots are written under the
+test's tmp_path, so the suite does not depend on any pre-existing folder.
 """
 
 import sys
-import os
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+import pytest
 from PySide6.QtWidgets import QApplication
 from core.storage import SecureStorage
 from ui.dialogs import RoomSetupDialog
 from ui.styles import NORMAL_STYLE
 
-app = QApplication.instance()
-if app is None:
-    app = QApplication(sys.argv)
 
-app.setStyleSheet(NORMAL_STYLE)
+@pytest.fixture(scope="session")
+def qapp():
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication(sys.argv)
+    app.setStyleSheet(NORMAL_STYLE)
+    return app
 
-storage = SecureStorage("test_artifacts/dialog_test.vault")
-dlg = RoomSetupDialog(storage)
-dlg.show()
-app.processEvents()
 
-# 1. Capture Host mode
-pix_host = dlg.grab()
-os.makedirs("test_artifacts", exist_ok=True)
-pix_host.save("test_artifacts/dialog_host_mode.png")
-print("[Captured] dialog_host_mode.png")
+def test_dialog_renders_all_modes(qapp, tmp_path):
+    out_dir = tmp_path / "dialog_shots"
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-# 2. Toggle to Join Room (Bluetooth)
-dlg.btn_role_join.click()
-dlg.btn_mode_bt.click()
-app.processEvents()
-pix_join_bt = dlg.grab()
-pix_join_bt.save("test_artifacts/dialog_join_bt_mode.png")
-print("[Captured] dialog_join_bt_mode.png")
+    storage = SecureStorage(str(tmp_path / "dialog_test.vault"))
+    dlg = RoomSetupDialog(storage)
+    dlg.show()
+    qapp.processEvents()
 
-# 3. Toggle to Join Room (Local Test Mesh)
-dlg.btn_mode_test.click()
-app.processEvents()
-pix_join_mesh = dlg.grab()
-pix_join_mesh.save("test_artifacts/dialog_join_mesh_mode.png")
-print("[Captured] dialog_join_mesh_mode.png")
+    # 1. Host mode
+    assert dlg.grab().save(str(out_dir / "dialog_host_mode.png"))
 
-dlg.close()
-print("All dialog screenshots captured successfully!")
+    # 2. Join Room (Bluetooth)
+    dlg.btn_role_join.click()
+    dlg.btn_mode_bt.click()
+    qapp.processEvents()
+    assert dlg.grab().save(str(out_dir / "dialog_join_bt_mode.png"))
+
+    # 3. Join Room (Local Test Mesh)
+    dlg.btn_mode_test.click()
+    qapp.processEvents()
+    assert dlg.grab().save(str(out_dir / "dialog_join_mesh_mode.png"))
+
+    dlg.close()

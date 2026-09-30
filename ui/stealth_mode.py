@@ -12,8 +12,9 @@ from ui.styles import NORMAL_STYLE, STEALTH_STYLE
 class StealthManager:
     """Controls the window transformation and styling for Stealth Mode."""
 
-    STEALTH_WIDTH = 320
+    STEALTH_WIDTH = 340
     STEALTH_HEIGHT = 440
+    _WIDGET_SIZE_MAX = 16777215  # Qt's QWIDGETSIZE_MAX, used to release a fixed-size lock
 
     def __init__(self, main_window: QMainWindow):
         self.win = main_window
@@ -36,15 +37,12 @@ class StealthManager:
         self.saved_geometry = self.win.geometry()
         self.is_stealth = True
 
-        # Position in top-right or bottom-right corner of screen
-        screen = QApplication.primaryScreen().availableGeometry()
-        x = screen.right() - self.STEALTH_WIDTH - 20
-        y = screen.top() + 40
+        # Let the window shrink below its normal minimum before compacting it.
+        self.win.setMinimumSize(0, 0)
 
         # Apply flags for floating on top
         self.win.setWindowFlags(self.win.windowFlags() | Qt.WindowStaysOnTopHint)
         self.win.setStyleSheet(STEALTH_STYLE)
-        self.win.setGeometry(x, y, self.STEALTH_WIDTH, self.STEALTH_HEIGHT)
 
         # Disguise window title
         self.win.setWindowTitle("Notes - Scratchpad")
@@ -53,7 +51,15 @@ class StealthManager:
         self.win.sidebar.setVisible(False)
         self.win.stealth_bar.setVisible(True)
         self.win.btn_stealth_toggle.setText("Exit Ghost")
-        
+
+        # Lock to the compact size so contents (incl. the exit control) can't
+        # push the window past the screen edge, then snap fully on-screen.
+        self.win.setFixedSize(self.STEALTH_WIDTH, self.STEALTH_HEIGHT)
+        screen = QApplication.primaryScreen().availableGeometry()
+        x = max(screen.left(), screen.right() - self.STEALTH_WIDTH - 20)
+        y = screen.top() + 40
+        self.win.move(x, y)
+
         # Render messages in plain text document style
         self.win.refresh_chat_display()
         self.win.show()
@@ -66,6 +72,10 @@ class StealthManager:
         self.is_stealth = False
         self.win.setWindowFlags(self.win.windowFlags() & ~Qt.WindowContextHelpButtonHint & ~Qt.WindowStaysOnTopHint)
         self.win.setStyleSheet(NORMAL_STYLE)
+
+        # Release the compact fixed-size lock applied in enter_stealth.
+        self.win.setMinimumSize(0, 0)
+        self.win.setMaximumSize(self._WIDGET_SIZE_MAX, self._WIDGET_SIZE_MAX)
 
         # Restore window geometry
         if self.saved_geometry:

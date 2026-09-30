@@ -115,6 +115,8 @@ def main():
     app.setApplicationName("AeroGhost")
     app.setOrganizationName("AeroGhostP2P")
     app.setStyleSheet(NORMAL_STYLE)
+    # App-wide icon so every window (setup dialog, chat, tray) is identifiable.
+    app.setWindowIcon(MainWindow._build_app_icon())
 
     args = parse_args()
     storage = SecureStorage()
@@ -219,7 +221,7 @@ def main():
                     f"Troubleshooting tips:\n"
                     f"1. Make sure the Host peer has clicked 'Create Room' first.\n"
                     f"2. Verify both devices have the same port/channel ({port}).\n"
-                    f"3. To test with 2 windows instantly on this PC, click '🚀 Launch Instant 2-Window Test'."
+                    f"3. To test with 2 windows instantly on this PC, click 'Launch Instant 2-Window Test'."
                 )
                 continue  # Re-open setup dialog; do NOT crash!
 

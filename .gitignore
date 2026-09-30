@@ -72,3 +72,10 @@ ENV/
 *.sublime-workspace
 .DS_Store
 Thumbs.db
+
+# Local AI assistant context / scaffolding (not for publication)
+GEMINI.md
+CLAUDE.md
+.gemini/
+.claude/
+subagents/

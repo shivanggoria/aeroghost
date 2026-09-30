@@ -3,15 +3,32 @@ Dialog Windows for AeroGhost
 Room setup, connection configuration, and incoming file transfer prompts.
 """
 
+import html
+import secrets
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, 
-    QPushButton, QRadioButton, QButtonGroup, QComboBox, 
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
+    QPushButton, QRadioButton, QButtonGroup, QComboBox,
     QMessageBox, QFrame, QSpinBox, QCheckBox, QScrollArea, QWidget
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QThread, Signal
 from core.bluetooth_engine import BluetoothEngine
 from core.storage import SecureStorage
 from ui.styles import NORMAL_STYLE
+
+# Minimum room password length enforced for manually created/joined rooms.
+MIN_PASSWORD_LENGTH = 8
+
+
+class _BluetoothScanWorker(QThread):
+    """Runs the Windows Bluetooth device scan off the UI thread so the dialog never freezes."""
+    finished_scan = Signal(list)
+
+    def run(self):
+        try:
+            devices = BluetoothEngine.scan_windows_bluetooth_devices()
+        except Exception:
+            devices = []
+        self.finished_scan.emit(devices)
 
 
 class RoomSetupDialog(QDialog):
@@ -36,6 +53,8 @@ class RoomSetupDialog(QDialog):
         self.target_address = "127.0.0.1"
         self.target_port = 19840
         self.launch_dual_test = False
+        self._scan_worker = None
+        self._scan_silent = False
 
         self._build_ui(default_nick)
 
@@ -70,7 +89,7 @@ class RoomSetupDialog(QDialog):
         form_layout.setContentsMargins(0, 2, 4, 2)
 
         # Quick Instant 2-Window Local Test Button
-        self.btn_instant_test = QPushButton("🚀  Launch Instant 2-Window Test (Side-by-Side)")
+        self.btn_instant_test = QPushButton("Launch Instant 2-Window Test (Side-by-Side)")
         self.btn_instant_test.setObjectName("InstantTestBtn")
         self.btn_instant_test.setMinimumHeight(36)
         self.btn_instant_test.setToolTip("Automatically opens Host and Client side-by-side on this PC")
@@ -84,13 +103,13 @@ class RoomSetupDialog(QDialog):
 
         role_container = QHBoxLayout()
         role_container.setSpacing(8)
-        self.btn_role_host = QPushButton("👑  Create Room (Host)")
+        self.btn_role_host = QPushButton("Create Room (Host)")
         self.btn_role_host.setProperty("role", "segment")
         self.btn_role_host.setCheckable(True)
         self.btn_role_host.setChecked(True)
         self.btn_role_host.setMinimumHeight(40)
 
-        self.btn_role_join = QPushButton("🔗  Join Room (Connect)")
+        self.btn_role_join = QPushButton("Join Room (Connect)")
         self.btn_role_join.setProperty("role", "segment")
         self.btn_role_join.setCheckable(True)
         self.btn_role_join.setMinimumHeight(40)
@@ -112,13 +131,13 @@ class RoomSetupDialog(QDialog):
 
         transport_container = QHBoxLayout()
         transport_container.setSpacing(8)
-        self.btn_mode_test = QPushButton("💻  Local Test Mesh (1 PC)")
+        self.btn_mode_test = QPushButton("Local Test Mesh (1 PC)")
         self.btn_mode_test.setProperty("role", "segment")
         self.btn_mode_test.setCheckable(True)
         self.btn_mode_test.setChecked(True)  # Default to Local Test Mesh for 1-click test reliability
         self.btn_mode_test.setMinimumHeight(40)
 
-        self.btn_mode_bt = QPushButton("📡  Bluetooth RFCOMM (2 PCs)")
+        self.btn_mode_bt = QPushButton("Bluetooth RFCOMM (2 PCs)")
         self.btn_mode_bt.setProperty("role", "segment")
         self.btn_mode_bt.setCheckable(True)
         self.btn_mode_bt.setMinimumHeight(40)
@@ -159,6 +178,9 @@ class RoomSetupDialog(QDialog):
             self.room_combo.addItems(recent_rooms)
         else:
             self.room_combo.addItem("general-room")
+        # Show the room name from the start rather than scrolled to the end.
+        if self.room_combo.lineEdit() is not None:
+            self.room_combo.lineEdit().setCursorPosition(0)
         col_room.addWidget(room_lbl)
         col_room.addWidget(self.room_combo)
         row_nick_room.addLayout(col_room)
@@ -200,7 +222,7 @@ class RoomSetupDialog(QDialog):
         self.target_edit.setPlaceholderText("e.g. 58:CD:C9:F6:F2:5A or 127.0.0.1")
         row_addr.addWidget(self.target_edit, 3)
 
-        self.btn_fill_local = QPushButton("⚡ Localhost")
+        self.btn_fill_local = QPushButton("Localhost")
         self.btn_fill_local.setMinimumHeight(36)
         self.btn_fill_local.setToolTip("Click to switch to Local Test Mesh and pre-fill 127.0.0.1")
         self.btn_fill_local.clicked.connect(self._fill_localhost)
@@ -222,8 +244,10 @@ class RoomSetupDialog(QDialog):
         self.port_lbl.setStyleSheet("font-weight: 500; color: #E2E8F0;")
         self.port_spin = QSpinBox()
         self.port_spin.setMinimumHeight(36)
-        self.port_spin.setRange(1, 65535)
-        self.port_spin.setValue(4)
+        # Default matches the default transport (Local Test Mesh -> loopback 19840).
+        # Switching to Bluetooth re-ranges this to an RFCOMM channel in _toggle_transport_ui.
+        self.port_spin.setRange(1024, 65535)
+        self.port_spin.setValue(19840)
         col_port.addWidget(self.port_lbl)
         col_port.addWidget(self.port_spin)
         row_scan_port.addLayout(col_port, 1)
@@ -268,7 +292,9 @@ class RoomSetupDialog(QDialog):
         """Prepares configuration for launching two connected instances on this PC."""
         self.launch_dual_test = True
         self.room_name = self.room_combo.currentText().strip() or "test-room"
-        self.password = self.pass_edit.text().strip() or "pass123"
+        # Both local windows share this value, so a strong random default is fine
+        # and avoids shipping a weak example password like "pass123".
+        self.password = self.pass_edit.text().strip() or secrets.token_urlsafe(12)
         self.nickname = self.nick_edit.text().strip() or "Alice"
         self.is_host = True
         self.is_bluetooth_mode = False
@@ -323,12 +349,19 @@ class RoomSetupDialog(QDialog):
             self.device_combo.setVisible(False)
 
     def _scan_devices(self, silent: bool = False):
+        # Run the Windows scan on a worker thread so the dialog never freezes.
+        if self._scan_worker is not None and self._scan_worker.isRunning():
+            return
+        self._scan_silent = silent
         self.scan_btn.setText("Scanning Bluetooth devices...")
         self.scan_btn.setEnabled(False)
-        devices = BluetoothEngine.scan_windows_bluetooth_devices()
+        self._scan_worker = _BluetoothScanWorker(self)
+        self._scan_worker.finished_scan.connect(self._on_scan_finished)
+        self._scan_worker.start()
+
+    def _on_scan_finished(self, devices):
         self.scan_btn.setText("Scan Nearby Devices")
         self.scan_btn.setEnabled(True)
-
         if devices:
             self.device_combo.clear()
             self.device_combo.addItem("-- Select Discovered Bluetooth Device --", "")
@@ -336,17 +369,21 @@ class RoomSetupDialog(QDialog):
                 label = f"{dev['name']} ({dev['mac']})" if dev['mac'] else dev['name']
                 self.device_combo.addItem(label, dev['mac'])
             self.device_combo.setVisible(True)
+            # Intentionally not auto-filling the address: the user selects a peer
+            # from the list, so a stray peripheral (e.g. a speaker) is never chosen
+            # for them.
+        elif not self._scan_silent:
+            QMessageBox.information(
+                self, "Bluetooth Scan",
+                "No active Bluetooth devices returned from scan. You can enter the "
+                "peer's MAC manually, or click 'Localhost' to test on this PC."
+            )
 
-            # If address is still blank, auto-populate with first scanned device
-            if not self.target_edit.text() and len(devices) > 0 and devices[0].get("mac"):
-                self.device_combo.setCurrentIndex(1)
-                self.target_edit.setText(devices[0]["mac"])
-        else:
-            if not silent:
-                QMessageBox.information(
-                    self, "Bluetooth Scan", 
-                    "No active Bluetooth devices returned from scan. You can enter the peer's MAC manually, or click '⚡ Localhost' to test on this PC."
-                )
+    def done(self, result):
+        # Let any in-flight scan thread finish before the dialog is destroyed.
+        if self._scan_worker is not None and self._scan_worker.isRunning():
+            self._scan_worker.wait(6000)
+        super().done(result)
 
     def _on_device_selected(self, index: int):
         mac = self.device_combo.currentData()
@@ -363,6 +400,14 @@ class RoomSetupDialog(QDialog):
             return
         if not pwd:
             QMessageBox.warning(self, "Missing Field", "Please specify a room password.")
+            return
+        if len(pwd) < MIN_PASSWORD_LENGTH:
+            QMessageBox.warning(
+                self, "Weak Password",
+                f"Room password must be at least {MIN_PASSWORD_LENGTH} characters.\n\n"
+                "The room key is derived from this password, so a longer passphrase "
+                "is the main protection against someone guessing it offline."
+            )
             return
         if not nick:
             QMessageBox.warning(self, "Missing Field", "Please enter a nickname.")
@@ -406,8 +451,11 @@ class FileOfferDialog(QDialog):
 
         size_kb = filesize / 1024.0
         size_str = f"{size_kb:.1f} KB" if size_kb < 1024 else f"{size_kb / 1024.0:.2f} MB"
-        
-        info = QLabel(f"<b>{sender}</b> is offering to send:<br><b>{filename}</b> ({size_str})")
+
+        # Escape peer-supplied sender/filename so they cannot inject markup here.
+        safe_sender = html.escape(str(sender))
+        safe_filename = html.escape(str(filename))
+        info = QLabel(f"<b>{safe_sender}</b> is offering to send:<br><b>{safe_filename}</b> ({size_str})")
         info.setWordWrap(True)
         layout.addWidget(info)
 

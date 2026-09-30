@@ -49,12 +49,24 @@ class OutgoingFileTransfer:
         }
 
     def read_chunk(self, chunk_index: int) -> Optional[bytes]:
-        """Reads a specific chunk from the file."""
+        """Reads a specific chunk from the file (opens the file per call; used by tests)."""
         if chunk_index < 0 or chunk_index >= self.total_chunks:
             return None
         with open(self.file_path, "rb") as f:
             f.seek(chunk_index * self.CHUNK_SIZE)
             return f.read(self.CHUNK_SIZE)
+
+    def iter_chunks(self):
+        """
+        Yields (chunk_index, chunk_bytes) streaming the whole file with a single
+        open file handle, avoiding a re-open/seek for every 32 KB chunk.
+        """
+        with open(self.file_path, "rb") as f:
+            for index in range(self.total_chunks):
+                data = f.read(self.CHUNK_SIZE)
+                if not data:
+                    break
+                yield index, data
 
 
 class IncomingFileTransfer:
