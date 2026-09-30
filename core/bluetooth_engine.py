@@ -27,10 +27,9 @@ class PeerConnection:
         self.peer_id: Optional[str] = None
         self.nickname: str = "Unknown Peer"
         self.is_authenticated: bool = False
-        # Per-session forward-secret key (X25519+HKDF), set once the handshake
-        # completes. While None, traffic on this connection uses the room key
-        # (that covers only the AUTH_HELLO/CHALLENGE/VERIFIED handshake itself).
-        self.session_key: Optional[bytes] = None
+        # Double Ratchet for this 1:1 link, set once the PAKE handshake completes.
+        # While None, the connection is still in the cleartext handshake phase.
+        self.ratchet = None
         self.is_alive = True
         self._buffer = bytearray()
         self._lock = threading.Lock()

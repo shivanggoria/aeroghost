@@ -1,6 +1,15 @@
 """
 Cryptographic Engine for AeroGhost Bluetooth P2P
-Zero-telemetry, end-to-end encrypted protocol using AES-256-GCM and PBKDF2.
+Zero-telemetry, end-to-end encrypted protocol.
+
+v2 cryptography:
+  - Argon2id                    memory-hard passphrase stretch (at-rest vault key)
+  - SPAKE2                      password-authenticated key exchange (no offline dictionary attack)
+  - X25519 + ML-KEM-768         hybrid classical/post-quantum key agreement
+  - HKDF-SHA256                 key derivation
+  - AES-256-GCM                 authenticated encryption
+The per-message Double Ratchet lives in core/ratchet.py and sender-key group
+encryption in core/sender_key.py; this module provides the primitives they use.
 """
 
 import os
@@ -9,17 +18,31 @@ import hashlib
 import uuid
 from typing import Tuple, Optional
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+from cryptography.hazmat.primitives.asymmetric.mlkem import MLKEM768PrivateKey, MLKEM768PublicKey
+from argon2.low_level import hash_secret_raw, Type as _Argon2Type
+from spake2 import SPAKE2_A, SPAKE2_B
+
+
+def hkdf_sha256(key_material: bytes, length: int = 32, salt: bytes = b"", info: bytes = b"") -> bytes:
+    """One-shot HKDF-SHA256."""
+    return HKDF(algorithm=hashes.SHA256(), length=length, salt=salt, info=info).derive(key_material)
 
 
 class CryptoEngine:
-    """Handles key derivation, mutual challenge-response authentication, and AEAD encryption/decryption."""
+    """Derives the at-rest vault key (Argon2id) and provides AEAD helpers.
 
-    # OWASP (2023) guidance for PBKDF2-HMAC-SHA256 is >= 600,000 iterations.
-    PBKDF2_ITERATIONS = 600_000
+    Transport authentication no longer relies on a password-derived key: the live
+    handshake uses SPAKE2 (a PAKE), so capturing it grants no offline dictionary
+    attack. Argon2id here protects the locally stored message history.
+    """
+
+    # Argon2id parameters (OWASP: >= 19 MiB; we use 64 MiB, memory-hard vs GPU/ASIC).
+    ARGON2_TIME_COST = 3
+    ARGON2_MEMORY_KIB = 64 * 1024  # 64 MiB
+    ARGON2_PARALLELISM = 4
 
     def __init__(self, room_name: str, password: str):
         self.room_name = room_name.strip()
@@ -33,35 +56,34 @@ class CryptoEngine:
         """
         Derive a deterministic room salt from the room name.
 
-        Design note: peers derive the shared room key offline from (room_name,
-        password) with no round-trip, so the salt cannot be random per-device --
-        both sides must reach the same salt from public information alone.
-        The salt therefore only provides domain separation between rooms, not the
-        per-secret randomness a stored-password salt would. Brute-force resistance
-        comes from the PBKDF2 iteration count above and from a strong passphrase.
+        The vault salt is deterministic from the room name so the same room +
+        password always reproduces the at-rest key on the same device. Brute-force
+        resistance against a stolen vault comes from Argon2id's memory-hardness
+        plus a strong passphrase; live traffic is protected by the PAKE instead.
         """
-        return hashlib.sha256(f"aeroghost_salt:v1:{room_name.lower()}".encode("utf-8")).digest()[:16]
+        return hashlib.sha256(f"aeroghost_salt:v2:{room_name.lower()}".encode("utf-8")).digest()[:16]
 
     @classmethod
     def _derive_key(cls, password: str, salt: bytes) -> bytes:
-        """Derive a 256-bit AES key using PBKDF2-HMAC-SHA256."""
-        kdf = PBKDF2HMAC(
-            algorithm=hashes.SHA256(),
-            length=32,
+        """Derive a 256-bit vault key using Argon2id (memory-hard)."""
+        return hash_secret_raw(
+            secret=password.encode("utf-8"),
             salt=salt,
-            iterations=cls.PBKDF2_ITERATIONS,
+            time_cost=cls.ARGON2_TIME_COST,
+            memory_cost=cls.ARGON2_MEMORY_KIB,
+            parallelism=cls.ARGON2_PARALLELISM,
+            hash_len=32,
+            type=_Argon2Type.ID,
         )
-        return kdf.derive(password.encode("utf-8"))
 
     @classmethod
     def _derive_room_uuid(cls, room_name: str, room_key: bytes) -> str:
         """
         Derive a deterministic 128-bit service UUID for Bluetooth RFCOMM / SDP.
 
-        Derived from the PBKDF2 room key via HMAC (not the raw password), so even
+        Derived from the Argon2id vault key via HMAC (not the raw password), so even
         if the UUID is published over SDP it cannot be used as a cheap offline
-        oracle to guess the passphrase -- recovering the key still costs a full
-        PBKDF2 evaluation per guess.
+        oracle to guess the passphrase.
         """
         h = hmac.new(room_key, f"aeroghost-sdp-uuid:{room_name.lower()}".encode("utf-8"), hashlib.sha256).digest()
         # Convert first 16 bytes into standard UUID format
@@ -98,16 +120,11 @@ class CryptoEngine:
         return self.decrypt_with_key(self.room_key, encrypted_data, associated_data)
 
     # ------------------------------------------------------------------
-    # Ephemeral Diffie-Hellman (X25519) for per-session forward secrecy
+    # X25519 ephemeral keys (reused by the hybrid handshake and the ratchet)
     # ------------------------------------------------------------------
     @staticmethod
     def generate_ephemeral_keypair() -> Tuple[X25519PrivateKey, bytes]:
-        """
-        Generate a one-shot X25519 keypair for a single handshake.
-        Returns (private_key_object, raw_32-byte_public_key). The private key is
-        never sent and is discarded once the session key is derived, which is what
-        gives forward secrecy: a later passphrase compromise cannot recompute it.
-        """
+        """Generate a one-shot X25519 keypair; returns (private_key, raw 32-byte public)."""
         private_key = X25519PrivateKey.generate()
         public_bytes = private_key.public_key().public_bytes(
             serialization.Encoding.Raw, serialization.PublicFormat.Raw
@@ -115,20 +132,9 @@ class CryptoEngine:
         return private_key, public_bytes
 
     @staticmethod
-    def derive_session_key(private_key: X25519PrivateKey, peer_public_bytes: bytes, salt: bytes) -> bytes:
-        """
-        Derive the shared 256-bit session key from our ephemeral private key and the
-        peer's ephemeral public key via X25519 + HKDF-SHA256. Both peers compute the
-        identical key from the same (salt, info) and the mutual DH shared secret.
-        """
-        peer_public = X25519PublicKey.from_public_bytes(peer_public_bytes)
-        shared_secret = private_key.exchange(peer_public)
-        return HKDF(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=salt,
-            info=b"aeroghost-session-v1",
-        ).derive(shared_secret)
+    def x25519_shared(private_key: X25519PrivateKey, peer_public_bytes: bytes) -> bytes:
+        """Raw X25519 Diffie-Hellman shared secret (32 bytes)."""
+        return private_key.exchange(X25519PublicKey.from_public_bytes(peer_public_bytes))
 
     def generate_challenge(self) -> bytes:
         """Generate a cryptographically secure 16-byte random challenge nonce."""
@@ -157,3 +163,72 @@ class CryptoEngine:
             while chunk := f.read(65536):
                 h.update(chunk)
         return h.hexdigest()
+
+
+# ======================================================================
+# v2 handshake primitives: SPAKE2 PAKE + hybrid X25519/ML-KEM-768 KEM
+# ======================================================================
+
+def x25519_public_from_private(private_key: X25519PrivateKey) -> bytes:
+    return private_key.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw
+    )
+
+
+def mlkem_keygen() -> Tuple[MLKEM768PrivateKey, bytes]:
+    """Generate an ML-KEM-768 keypair; returns (private_key, raw public-key bytes)."""
+    private_key = MLKEM768PrivateKey.generate()
+    return private_key, private_key.public_key().public_bytes_raw()
+
+
+def mlkem_encapsulate(peer_public_bytes: bytes) -> Tuple[bytes, bytes]:
+    """
+    Encapsulate to an ML-KEM-768 public key.
+    Returns (shared_secret_32B, ciphertext_1088B). The responder runs this.
+    """
+    public_key = MLKEM768PublicKey.from_public_bytes(peer_public_bytes)
+    shared_secret, ciphertext = public_key.encapsulate()
+    return shared_secret, ciphertext
+
+
+def mlkem_decapsulate(private_key: MLKEM768PrivateKey, ciphertext: bytes) -> bytes:
+    """Decapsulate an ML-KEM-768 ciphertext back to the shared secret. The initiator runs this."""
+    return private_key.decapsulate(ciphertext)
+
+
+def pake_new(password: str, is_initiator: bool):
+    """
+    Create a SPAKE2 state for one handshake. Returns (state, outbound_message).
+    The two roles (A=initiator, B=responder) must differ so the exchange completes.
+    """
+    pw = password.encode("utf-8")
+    state = SPAKE2_A(pw) if is_initiator else SPAKE2_B(pw)
+    return state, state.start()
+
+
+def pake_finish(state, peer_message: bytes) -> bytes:
+    """Finish SPAKE2 with the peer's message, returning the 32-byte PAKE key.
+
+    If the two sides used different passwords, the keys will simply differ; the
+    handshake then fails at the key-confirmation step below.
+    """
+    return state.finish(peer_message)
+
+
+def derive_root_key(pake_key: bytes, x25519_shared: bytes, mlkem_shared: bytes, salt: bytes) -> bytes:
+    """
+    Combine the PAKE key with the classical (X25519) and post-quantum (ML-KEM)
+    shared secrets into one 256-bit root key via HKDF. An attacker must break the
+    password (PAKE) AND X25519 AND ML-KEM to recover it.
+    """
+    ikm = pake_key + x25519_shared + mlkem_shared
+    return hkdf_sha256(ikm, length=32, salt=salt, info=b"aeroghost-v2-root")
+
+
+def confirm_tag(root_key: bytes, label: bytes, transcript: bytes) -> bytes:
+    """Key-confirmation MAC over the handshake transcript, keyed by the root key."""
+    return hmac.new(root_key, label + transcript, hashlib.sha256).digest()
+
+
+def verify_confirm_tag(root_key: bytes, label: bytes, transcript: bytes, tag: bytes) -> bool:
+    return hmac.compare_digest(confirm_tag(root_key, label, transcript), tag)

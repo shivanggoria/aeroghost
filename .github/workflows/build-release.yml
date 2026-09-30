@@ -36,7 +36,7 @@ jobs:
 
       - name: Build Standalone Single-File Executable
         run: |
-          pyinstaller --onefile --windowed --name AeroGhost --clean main.py
+          pyinstaller --onefile --windowed --name AeroGhost --clean --collect-all argon2 --collect-all spake2 main.py
 
       - name: Create GitHub Release and Upload Artifact
         uses: softprops/action-gh-release@v2

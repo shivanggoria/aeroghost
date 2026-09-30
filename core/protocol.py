@@ -9,23 +9,27 @@ import base64
 from typing import Dict, Any, Optional, Tuple
 
 class PacketType:
-    AUTH_HELLO = "AUTH_HELLO"
-    AUTH_CHALLENGE = "AUTH_CHALLENGE"
-    AUTH_VERIFIED = "AUTH_VERIFIED"
+    # v2 PAKE + hybrid handshake (sent in clear; safe by construction)
+    PAKE_HELLO = "PAKE_HELLO"
+    PAKE_REPLY = "PAKE_REPLY"
+    PAKE_CONFIRM = "PAKE_CONFIRM"
     AUTH_REJECT = "AUTH_REJECT"
-    
-    CHAT_MESSAGE = "CHAT_MESSAGE"
+
+    CHAT_MESSAGE = "CHAT_MESSAGE"      # inner plaintext message dict (inside GROUP_MSG)
+    GROUP_MSG = "GROUP_MSG"           # sender-key-encrypted group content (opaque to relay)
+    SENDER_KEY_DIST = "SENDER_KEY_DIST"  # distribute a member's sender key
+    GROUP_REKEY = "GROUP_REKEY"       # host-issued signal to rotate sender keys
     PEER_LIST = "PEER_LIST"
     PEER_JOIN = "PEER_JOIN"
     PEER_LEAVE = "PEER_LEAVE"
-    
+
     FILE_OFFER = "FILE_OFFER"
     FILE_ACCEPT = "FILE_ACCEPT"
     FILE_REJECT = "FILE_REJECT"
     FILE_CHUNK = "FILE_CHUNK"
     FILE_ACK = "FILE_ACK"
     FILE_COMPLETE = "FILE_COMPLETE"
-    
+
     HEARTBEAT = "HEARTBEAT"
 
 

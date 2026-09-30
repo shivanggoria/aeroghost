@@ -22,8 +22,10 @@ def qapp():
     return app
 
 
-def test_kdf_iterations_meet_owasp():
-    assert CryptoEngine.PBKDF2_ITERATIONS >= 600_000
+def test_kdf_is_argon2id_memory_hard():
+    # Argon2id vault key: OWASP minimum is 19 MiB; we use more.
+    assert CryptoEngine.ARGON2_MEMORY_KIB >= 19 * 1024
+    assert CryptoEngine.ARGON2_TIME_COST >= 2
 
 
 def test_room_uuid_not_derived_from_raw_password():
@@ -114,28 +116,37 @@ def test_escape_exits_stealth_via_event_filter(qapp, tmp_path):
 
 
 def test_accept_file_targets_offering_peer(tmp_path, monkeypatch):
-    """accept_file should reply only to the offering peer, not broadcast to the room."""
+    """accept_file should unicast FILE_ACCEPT to the offering peer, not broadcast."""
     mgr = GroupManager("Recv", is_bluetooth_mode=False, db_path=str(tmp_path / "f.vault"))
     mgr.setup_room("file-room", "password-1234", is_host=True, port=29614)
 
-    sent_to = []
+    sent = []
 
     class FakePeer:
         peer_id = "offerer"
+        ratchet = object()  # non-None so _route_out sends directly to this peer
 
-    fake_peer = FakePeer()
-    monkeypatch.setattr(mgr, "_send_packet", lambda peer, pkt: sent_to.append((peer, pkt.get("type"))))
-    broadcast_called = []
-    monkeypatch.setattr(mgr.engine, "broadcast_frame", lambda *a, **k: broadcast_called.append(True))
+        def close(self):
+            pass
+
+    offerer = FakePeer()
+    mgr.engine.peers["offerer"] = offerer
+    monkeypatch.setattr(
+        mgr, "_send_packet",
+        lambda peer, pkt: sent.append((getattr(peer, "peer_id", None), pkt.get("type"), pkt.get("to"))),
+    )
+
+    class SrcPeer:
+        peer_id = "offerer"
 
     offer = {
-        "type": "FILE_OFFER", "transfer_id": "tid-1", "sender": "Bob",
+        "type": "FILE_OFFER", "transfer_id": "tid-1", "offerer_id": "offerer", "sender": "Bob",
         "filename": "a.txt", "filesize": 10, "sha256": "0" * 64,
         "chunk_size": 32768, "total_chunks": 1,
     }
-    mgr._on_file_offer(fake_peer, offer)
+    mgr._on_file_offer(SrcPeer(), offer)
     mgr.accept_file("tid-1")
 
-    assert (fake_peer, "FILE_ACCEPT") in sent_to
-    assert not broadcast_called  # targeted send, no room-wide fan-out
+    # Exactly one send, addressed (to=) the offerer.
+    assert sent == [("offerer", "FILE_ACCEPT", "offerer")]
     mgr.shutdown()

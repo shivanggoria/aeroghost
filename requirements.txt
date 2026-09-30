@@ -1,2 +1,4 @@
 PySide6>=6.6.0
-cryptography>=42.0.0
+cryptography>=46.0.0
+argon2-cffi>=23.1.0
+spake2>=0.8
